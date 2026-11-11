@@ -33,7 +33,19 @@ except Exception:  # pragma: no cover - tz database missing
 
 POLL_SECONDS = max(60, int(os.environ.get("POLL_SECONDS", "180")))
 ALERT_MODE = os.environ.get("ALERT_MODE", "all").strip().lower()      # all | deals
-MAX_SILENT_PER_CYCLE = int(os.environ.get("MAX_SILENT_PER_CYCLE", "8"))
+MAX_SILENT_PER_CYCLE = int(os.environ.get("MAX_SILENT_PER_CYCLE", "15"))
+MAX_ALERT_AGE_HOURS = float(os.environ.get("MAX_ALERT_AGE_HOURS", "24"))   # older posts are stored silently, never alerted
+
+# Facebook Marketplace goes through an Apify actor (Facebook blocks direct scraping). Needs APIFY_TOKEN.
+FB_ACTOR = os.environ.get("FB_ACTOR", "raidr-api~facebook-marketplace-scraper")
+FB_TERMS = [t.strip() for t in os.environ.get(
+    "FB_TERMS", "peugeot,renault,ford,opel,volkswagen,citroen,toyota,bmw,mercedes,audi,seat,fiat,avariado,para peças,motor fundido,não pega"
+).split(",") if t.strip()]
+FB_LOCATION = os.environ.get("FB_LOCATION", "Funchal, Portugal")
+FB_RADIUS_KM = os.environ.get("FB_RADIUS_KM", "40")
+FB_PER_SEARCH = int(os.environ.get("FB_PER_SEARCH", "15"))
+FB_MAX_COST = os.environ.get("FB_MAX_COST", "0.05")                          # hard cap per run, USD
+FB_DAYS = os.environ.get("FB_DAYS", "1")
 QUIET_HOURS = os.environ.get("QUIET_HOURS", "").strip()               # e.g. 01-08 (Madeira time)
 
 HEADERS = {
@@ -64,6 +76,7 @@ SOURCES = [
          urls=["https://www.custojusto.pt/madeira/veiculos/carros-usados"], fallback=[]),
     dict(key="cj_salv", family="cj", name="CustoJusto", link=CJ_LINK, base="https://www.custojusto.pt", salvage=True,
          urls=["https://www.custojusto.pt/madeira/veiculos/carros-usados/salvado"], fallback=[]),
+    dict(key="fb", family="fb", name="Facebook", kind="apify", salvage=False, urls=[], fallback=[]),
 ]
 
 
@@ -368,7 +381,122 @@ def parse_page(src, page):
     return cards
 
 
+# --------------------------------------------------------------------------- #
+# Facebook Marketplace (via Apify)
+# --------------------------------------------------------------------------- #
+_FB_JUNK = re.compile(r"brinquedo|lavagem|lavados|miniatura|telecomandad|\b12v\b|mclaren f1|capa para|\bjantes?\b|\bpneus?\b|bateria|autocolante", re.I)
+
+
+def _money_to_int(text):
+    s = re.sub(r"[^\d.,]", "", str(text or ""))
+    if not s:
+        return None
+    if re.fullmatch(r"\d{1,3}(?:[.,]\d{3})+", s):
+        s = re.sub(r"[.,]", "", s)
+    else:
+        s = s.replace(",", ".")
+    try:
+        return int(float(s))
+    except ValueError:
+        return None
+
+
+def _fb_price(item):
+    p = item.get("price")
+    val = None
+    if isinstance(p, dict):
+        for k in ("amount", "value"):
+            try:
+                val = int(float(str(p.get(k)).replace(",", "")))
+                break
+            except (TypeError, ValueError):
+                pass
+        if val is None:
+            val = _money_to_int(p.get("formatted"))
+    elif p is not None:
+        val = _money_to_int(p)
+    return val if val and val >= 300 else None      # €1 / €10 are "contact seller" placeholders
+
+
+def _fb_time(item):
+    for k in ("listing_date_ms", "listingDateMs", "creation_time", "creationTime", "createdAt", "listing_date"):
+        v = item.get(k)
+        if v in (None, ""):
+            continue
+        try:
+            f = float(v)
+            if f > 1e12:
+                f /= 1000.0
+            return datetime.fromtimestamp(f, timezone.utc).isoformat(timespec="seconds")
+        except (TypeError, ValueError, OverflowError, OSError):
+            iso = _iso_utc(str(v).replace("Z", "+00:00").replace(" UTC", "+00:00").replace(" ", "T", 1))
+            if iso:
+                return iso
+    return None
+
+
+def _fb_year(title):
+    t = title.strip()
+    m = re.match(r"(19[89]\d|20[0-2]\d)\b", t) or re.search(r"(?<![\w-])(19[89]\d|20[0-2]\d)\s*[/)]", t) or re.search(r"\b(?:ano|de)\s+(19[89]\d|20[0-2]\d)\b", t, re.I)
+    return int(m.group(1)) if m else None
+
+
+def parse_fb_items(items):
+    cards, seen = [], set()
+    for it in items or []:
+        if not isinstance(it, dict) or it.get("isSold"):
+            continue
+        url = (it.get("url") or "").split("?")[0]
+        title = (it.get("title") or "").strip()
+        m = re.search(r"/item/(\d+)", url)
+        if not (m and title) or url in seen:
+            continue
+        if is_junk(title) or _FB_JUNK.search(title):
+            continue
+        seen.add(url)
+        loc = it.get("location")
+        city = (loc.get("city") or "") if isinstance(loc, dict) else (str(loc or ""))
+        if not city and isinstance(loc, dict):
+            city = (loc.get("state") or "")
+        img = it.get("primaryImage") or ""
+        if isinstance(img, dict):
+            img = img.get("uri") or img.get("url") or ""
+        cards.append({"url": url, "title": title, "source": "Facebook", "salvage": False, "image_url": img,
+                      "price": _fb_price(it), "year": _fb_year(title), "mileage": None, "fuel": "", "location": city,
+                      "market_flag": "", "published_at": _fb_time(it), "description": (it.get("description") or "")[:2500],
+                      "source_id": m.group(1)})
+    return cards
+
+
+def fetch_fb(http):
+    """Returns raw Apify dataset items, or None when this run should skip Facebook."""
+    token = os.environ.get("APIFY_TOKEN", "").strip()
+    if not token:
+        log("fb: APIFY_TOKEN not set, skipping Facebook")
+        return None
+    if in_quiet_hours() and datetime.now(MADEIRA).minute >= 30:
+        return None                      # at night only every other run, to save Apify credit
+    payload = {"searchMode": "simple", "searchTerms": FB_TERMS, "location": FB_LOCATION, "radiusKm": FB_RADIUS_KM,
+               "daysListed": FB_DAYS, "listingsPerSearch": FB_PER_SEARCH,
+               "fetchDetailedItems": False, "fetchListingMedia": False}
+    r = http.post("https://api.apify.com/v2/acts/%s/run-sync-get-dataset-items" % FB_ACTOR,
+                  params={"token": token, "maxTotalChargeUsd": FB_MAX_COST, "clean": "true"}, json=payload, timeout=290)
+    if r.status_code >= 400:
+        raise requests.RequestException("Apify HTTP %d: %s" % (r.status_code, r.text[:200].replace(token, "***")))
+    data = r.json()
+    if not isinstance(data, list):
+        raise requests.RequestException("Apify returned unexpected data: %s" % str(data)[:200])
+    return data
+
+
+def scrape_fb(http):
+    items = fetch_fb(http)
+    return None if items is None else parse_fb_items(items)
+
+
 def scrape_source(src, http):
+    if src.get("kind") == "apify":
+        return scrape_fb(http)
     cards, seen = [], set()
 
     def collect(urls):
@@ -500,7 +628,7 @@ def alert_new(listing_id, http, ctx):
     issue = {1: "mech", 2: "body"}.get(L["broken"], "")
     reason = L["broken_reason"] or ""
     desc = L.get("description") or ""
-    if not desc:
+    if not desc and L["source"] != "Facebook":
         try:
             desc = page_description(fetch(L["url"], http))
         except Exception as exc:  # detail page is a bonus; never block an alert on it
@@ -557,6 +685,45 @@ def record_result(key, count, error="", may_be_empty=False):
         send_telegram(warn)
 
 
+def _when(row):
+    """Best guess of when a listing was posted (falls back to when we first saw it)."""
+    for key in ("published_at", "first_seen_at"):
+        v = row[key]
+        if v:
+            try:
+                d = datetime.fromisoformat(str(v))
+                return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+    return datetime.now(timezone.utc)
+
+
+def send_pending(http, ctx, new_ids, drops):
+    """Alert oldest -> newest, so the last Telegram message is always the most recent car.
+    Listings posted more than MAX_ALERT_AGE_HOURS ago are stored but not alerted."""
+    rows = []
+    with session() as con:
+        for lid in new_ids:
+            row = con.execute("SELECT id, published_at, first_seen_at FROM listings WHERE id=?", (lid,)).fetchone()
+            if row is not None:
+                rows.append((_when(row), lid))
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=MAX_ALERT_AGE_HOURS)
+    fresh = sorted(r for r in rows if r[0] >= cutoff)
+    if len(fresh) < len(rows):
+        log("%d new listing(s) were posted more than %sh ago: stored without alert" % (len(rows) - len(fresh), MAX_ALERT_AGE_HOURS))
+    for _, lid in fresh:
+        try:
+            alert_new(lid, http, ctx)
+        except Exception as exc:
+            log("alert failed for listing %s: %s" % (lid, exc))
+        time.sleep(random.uniform(0.5, 1.5))
+    for lid, old in drops:
+        try:
+            alert_drop(lid, old, ctx)
+        except Exception as exc:
+            log("drop alert failed for listing %s: %s" % (lid, exc))
+
+
 _backoff = {}
 
 
@@ -564,12 +731,15 @@ def run_cycle(http=None):
     http = http or requests.Session()
     ctx = {"silent_sent": 0, "silent_skipped": 0}
     announced = []
+    pending_new, pending_drops = [], []
     for src in SOURCES:
         key = src["key"]
         if time.time() < _backoff.get(key, 0):
             continue
         try:
             cards = scrape_source(src, http)
+            if cards is None:          # source deliberately skipped this run
+                continue
         except Blocked as exc:
             _backoff[key] = time.time() + 900
             log("%s: blocked (%s), pausing this source for 15 min" % (key, exc))
@@ -600,19 +770,11 @@ def run_cycle(http=None):
             log("%s: first run, stored %d existing listings silently (no alerts for these)" % (key, len(cards)))
         else:
             log("%s: %d parsed, %d new, %d price drops" % (key, len(cards), len(new_ids), len(drops)))
-            for lid in new_ids:
-                try:
-                    alert_new(lid, http, ctx)
-                except Exception as exc:
-                    log("alert failed for listing %s: %s" % (lid, exc))
-                time.sleep(random.uniform(0.5, 1.5))
-            for lid, old in drops:
-                try:
-                    alert_drop(lid, old, ctx)
-                except Exception as exc:
-                    log("drop alert failed for listing %s: %s" % (lid, exc))
+            pending_new.extend(new_ids)
+            pending_drops.extend(drops)
         STATUS[key] = {"ok": True, "parsed": len(cards), "new": len(new_ids) if baselined else 0, "at": core.now_iso()}
         time.sleep(random.uniform(1.5, 4.0))
+    send_pending(http, ctx, pending_new, pending_drops)
     if ctx["silent_skipped"]:
         send_telegram("🚗 +%d more new listings this round (not shown individually). Open the dashboard to see them." % ctx["silent_skipped"], silent=True)
     if announced:
@@ -647,6 +809,17 @@ def self_test(save=False):
     if save:
         os.makedirs("debug", exist_ok=True)
     for src in SOURCES:
+        if src.get("kind") == "apify":
+            print("\n=== fb  (Apify actor %s)" % FB_ACTOR)
+            try:
+                items = fetch_fb(http)
+                cards = parse_fb_items(items or [])
+                print("   %s raw items, parsed %d listings" % ("no" if items is None else len(items), len(cards)))
+                for c in cards[:3]:
+                    print("   - %s | %s | %s | %s | %s" % (c["title"], c.get("price"), c.get("location"), c.get("published_at"), c["url"]))
+            except Exception as exc:
+                print("   FACEBOOK FAILED: %s" % exc)
+            continue
         url = src["urls"][0]
         print("\n=== %s  %s" % (src["key"], url))
         try:
