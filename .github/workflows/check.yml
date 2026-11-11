@@ -34,7 +34,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          QUIET_HOURS: "01-08"
+                    APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}          QUIET_HOURS: "01-08"
         run: python scraper.py --once
 
       - name: Fold database into a single file
