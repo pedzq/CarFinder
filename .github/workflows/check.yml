@@ -1,0 +1,64 @@
+name: CarFinder check
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: carfinder
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Connectivity test (manual runs only)
+        if: github.event_name == 'workflow_dispatch'
+        run: python scraper.py --test
+
+      - name: Check for new cars
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          QUIET_HOURS: "01-08"
+        run: python scraper.py --once
+
+      - name: Fold database into a single file
+        if: always()
+        run: |
+          python - <<'PY'
+          import sqlite3, os
+          if os.path.exists("carfinder.db"):
+              c = sqlite3.connect("carfinder.db")
+              c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+              c.execute("PRAGMA journal_mode=DELETE")
+              c.close()
+          PY
+
+      - name: Save database back to the repo
+        if: always()
+        run: |
+          git config user.name "carfinder-bot"
+          git config user.email "carfinder-bot@users.noreply.github.com"
+          git add carfinder.db || true
+          if git diff --cached --quiet; then
+            echo "no changes"
+          else
+            git commit -m "update database"
+            git pull --rebase -X theirs || true
+            git push
+          fi
